@@ -219,6 +219,39 @@ Cada segmento de `SplineMesh` agora responde **Overlap** a `Pawn` e `PhysicsBody
 
 ---
 
+## 6.8 Multiplayer — bloco 1: movimento e RPCs (servidor autoritativo)
+
+Contexto: análise de replicação (somente leitura) apontou que o projeto não estava pronto para multiplayer. Modelo adotado: **servidor autoritativo para física/habilidades; o cliente só envia input**. Este bloco cobre movimento e pulo (itens C3/C4 da análise). Interação/itens/habilidades (C1/C2/C4b), animações de mira/emote, grab/grind e itens médios **ainda não foram tratados**.
+
+### 6.8.1 Diagnóstico (resumo)
+
+- RPCs decodificados do `.uasset` (as ferramentas MCP não expõem flags): `ServerRPC_SendInput`, `Server_Jump`, `RPC_LocalMic`, `Server_SetSpeaking` = Server + Reliable; `Multicast_Jump` = Multicast **Unreliable**; `Rettach/Detach Player Multicast` = Multicast Reliable; `BPC_WheelchairMovement.ServerRPC_Movement` = Server **Unreliable**.
+- `BP_CharacterMaster.EventTick` chamava `Movement` em todas as máquinas: o servidor executava `ServerRPC_Movement` localmente **e** recebia a RPC do cliente → `AddForce` em dobro; proxies simulados chamavam a RPC sem dono (warning `No owning connection ... ServerRPC_Movement will not be processed`).
+- `IA_Move` (Triggered) e `IA_Jump` (Started + Triggered) enviavam RPC **Reliable a cada frame**.
+- O AnimBP (`ABP_WheelChair`) lê `bIsJump`, `bIsFalling`, `ForwardInput` e `TurnInput` de `BPC_WheelchairMovement`, que não replicava (componente com `bReplicates = false`).
+
+### 6.8.2 Mudanças
+
+- **`BPC_WheelchairMovement.Movement`:** agora começa com `Switch Has Authority`; só o ramo *Authority* executa (Grind, `CheckIfFalling`, gravidade extra, damping, `ServerRPC_Movement`). Clientes não simulam movimento localmente (dependem da física replicada; a resposta ao input tem a latência de ida e volta).
+- **Replicação do componente:** `SetIsReplicated(true)` no `BeginPlay` do componente (o template no `BP_CharacterMaster` gravava `bReplicates = false` e sobrepunha o padrão da classe; o CDO também foi marcado `true`). Variáveis `ForwardInput`, `TurnInput`, `bIsJump` e `bIsFalling` agora `Replicated`.
+- **Pulo:** `IA_Jump` só chama `Server_Jump` no `Started` (o link do `Triggered` foi removido); `Server_Jump` chama `BPC_WheelchairMovement.Jump` direto no servidor, sem `Multicast_Jump` (o evento continua no grafo, sem uso). Resultado: 1 RPC no press e 1 no release.
+- **`IA_Move` (asset):** trigger `Pulse` (`interval = 0.05`, `bTriggerOnStart = true`) → envio a 20 Hz em vez de por frame. `Canceled` agora também liga em `ServerRPC_SendInput(0,0)`, porque soltar a tecla entre pulsos gera `Canceled` (não `Completed`).
+- **Não foi possível** (limite das ferramentas): mudar Reliable → Unreliable dos RPCs, nem inserir "enviar só se mudou" antes de `ServerRPC_SendInput` (o evento vive num grafo colapsado e não é chamável de função/EventGraph).
+
+### 6.8.3 Validação (PIE em rede: servidor + 2 clientes)
+
+- Espaço no *Client 2* → `Server_Jump` executa **no servidor**, uma vez no press e uma no release; nenhuma execução nos clientes.
+- Os warnings `No owning connection ... ServerRPC_Movement` deixaram de aparecer.
+- No cliente: `BPC_WheelchairMovement.bReplicates = true` e `bIsFalling` chega replicado.
+- **Não testado:** movimento com tecla segurada e animação de rodas em clientes (as ferramentas só enviam press+release instantâneo); Grind em rede.
+- Erro de runtime que permanece (não tratado neste bloco): `BP_WWController.BeginPlay` cria o HUD (`CreateWidget`/`AddToViewport`) também no servidor → `Accessed None` (item M1 da análise).
+
+### 6.8.4 Limpeza: nós órfãos deixados por `write_graph_dsl`
+
+Reescrever um grafo via DSL **não apaga os nós antigos**: eles ficam desconectados do fluxo (não executam), mas inflam o `.uasset` e mantêm strings antigas. Encontrado: `StartGrind` 359 órfãos (de 416 nós), `HandleGrindJump` 52 (de 62), `BP_GrabPistol.UpdateHeldObject` 14 (de 39), incluindo `PrintString` de debug — o commit `cc6a73f` já continha strings `GRINDDBG`. Os órfãos foram apagados por script (nós inalcançáveis por execução e que não são dependência de dados de nó vivo); `BPC_WheelchairMovement.uasset` caiu de ~1,5 MB para ~655 KB e não há mais strings de debug. **Ao usar `write_graph_dsl`, conferir órfãos depois.**
+
+---
+
 ## 7. Débito técnico / pendências
 
 - **Prints de debug temporários** ainda presentes (usados para diagnosticar os bugs de velocidade zerada):
@@ -237,7 +270,8 @@ Cada segmento de `SplineMesh` agora responde **Overlap** a `Pawn` e `PhysicsBody
   - O corpo de `BPC_WheelchairMovement::Jump` roda também no *release* do botão (e sem guarda de `bIsJump`), repetindo o impulso de 800; comportamento anterior, não alterado.
   - Rail com escala não uniforme não foi testado; o `GrindHeightOffset` padrão (190) assume o mesh `SM_BoxCentered` (100 de altura) e cápsula de meia altura 90.
   - Rails deixaram de ser sólidos para o Pawn/PhysicsBody (ver 6.7.4).
-  - O `.uasset` do `BPC_WheelchairMovement` cresceu (~240 KB → ~1,4 MB) por causa dos nós gerados via DSL.
+  - O `.uasset` do `BPC_WheelchairMovement` cresceu (~240 KB → ~655 KB) por causa dos nós gerados via DSL (depois da limpeza de órfãos, ver 6.8.4).
+- **Multiplayer — pendências da análise (ainda não tratadas):** interação/`AttachItem` e `HeldItem` só no cliente que apertou F, `GiveAbility` chamado no cliente (inválido no GAS), projéteis/splat/`bIsThrown` não replicados e `DestroyActor`/`SpawnActor` em todas as máquinas, `AnimationChooser` (mira/emote) setado só localmente, grab e grind sem servidor, `PlayerControllerReference` só no dono (usado por `GA_SauceShot`), `OnComponentHit`→`DetachPlayerMulticast` em todas as máquinas, HUD sem `IsLocalController`, prompt de `BP_InteractableMaster` sem checar jogador local.
 - **Interação (F) com `BP_ItemMaster` — diagnóstico (sem alteração de código):** a instância `BP_ItemMaster_C_1` do `L_Sandbox` tem `ItemInfo = None`; `AttachItem` lê `ShotAbility` e `Socket` do `ItemInfoReference` e gera `Accessed None` (nós `Branch` e `Attach Actor To Component`), então o item não fica na mão. Além disso, `InteractDetect` não valida o resultado do trace (F em parede/vazio chama `AttachItem` com ator inválido e solta o item segurado) e o trace sai da raiz do `PlayerCameraManager` (~800 u atrás do pawn, 1200 de comprimento, na altura da câmera).
 
 ---
@@ -248,6 +282,10 @@ Cada segmento de `SplineMesh` agora responde **Overlap** a `Pawn` e `PhysicsBody
 |---|---|
 | `Content/Main/Core/Components/BPC_WheelchairMovement` | Fix gravidade extra + damping angular; **Grind/Slide** (funções `TryStartGrind`/`StartGrind`/`UpdateGrind`/`EndGrind`/`HandleGrindJump`, variáveis *Grind*, gate `bGrindArmed`, ramos em `Movement` e `Jump`) |
 | `Content/Main/Core/Interactables/BP_SplineGrindMaster` | Segmentos do rail com resposta Overlap a `Pawn`/`PhysicsBody` |
+| `Content/Main/Core/Components/BPC_WheelchairMovement` (multiplayer) | `Movement` só com autoridade, `SetIsReplicated(true)`, 4 variáveis replicadas, limpeza de nós órfãos |
+| `Content/Main/Core/Player/BP_CharacterMaster` (multiplayer) | `Server_Jump` chama `Jump` direto (sem `Multicast_Jump`), `IA_Jump` só no `Started`, `IA_Move Canceled` → `SendInput(0,0)` |
+| `Content/Main/Core/Inputs/Actions/IA_Move` | Trigger `Pulse` (0,05 s) |
+| `Content/Main/Core/Items/BP_GrabPistol` | Limpeza de nós órfãos em `UpdateHeldObject` |
 | `Content/Main/Core/Components/BPC_InteractionDetector` | Fix colisão da esfera do item + guarda `IsValidClass` |
 | `Content/Main/Core/Abilities/GA_Throw` | **Novo** — ability de arremesso |
 | `Content/Main/Core/Abilities/GA_Catch` | **Novo** — ability de captura |
