@@ -1,6 +1,6 @@
 # Changelog — Sessões de trabalho via MCP (Unreal Editor)
 
-Registro de todas as mudanças feitas no projeto `WheelyWiener_V0.1` através do agente de IA conectado ao MCP (`http://127.0.0.1:8000/mcp`). Cobre desde a investigação inicial de bugs de movimento até a implementação completa do mecanismo de Arremesso/Captura (Throw & Catch) do `BP_SauceMaster` e o Grab com `BP_GrabPistol` (distância pela roda do mouse, linha de debug e altura ajustável).
+Registro de todas as mudanças feitas no projeto `WheelyWiener_V0.1` através do agente de IA conectado ao MCP (`http://127.0.0.1:8000/mcp`). Cobre desde a investigação inicial de bugs de movimento até a implementação completa do mecanismo de Arremesso/Captura (Throw & Catch) do `BP_SauceMaster`, o Grab com `BP_GrabPistol` (distância pela roda do mouse, linha de debug e altura ajustável) e o Grind/Slide em rails `BP_SplineGrindMaster`.
 
 ---
 
@@ -178,6 +178,47 @@ O ator implementa `BPI_Grab` (passava na checagem), mas `IsSimulatingPhysics(Hit
 
 ---
 
+## 6.7 Grind/Slide em rails (`BP_SplineGrindMaster`)
+
+O `BP_SplineGrindMaster` só montava segmentos de `SplineMesh` ao longo da `Spline` (sem gameplay). O `BPI_Interact.GetGrindSpline` já existia, mas sem uso nem implementação; o Grind lê a `Spline` direto do rail.
+
+### 6.7.1 Comportamento
+
+- **Detecção e início:** o pawn precisa estar **armado** (ver 6.7.3), sem Grind ativo, fora do cooldown, caindo (`vz < -GrindMinFallSpeed`) e sobrepondo um `BP_SplineGrindMaster`. Com o centro da cápsula acima do trilho (−20) e a até `GrindMaxSnapDistance` do ponto mais próximo da spline, e com trilho à frente na direção do movimento (>0,02 de chave).
+- **Direção:** sinal da velocidade projetada na tangente da spline; se `|vel·tangente| ≤ 50`, usa o vetor frontal da cápsula.
+- **Percurso:** avança pelo **input key** da spline (`key += dir * GrindSpeed * dt / |tangente_mundo|`), sem usar `GetSplineLength`/distâncias (que neste UE 5.8 não são consistentes com a escala do ator). Funciona com rails escalados. Gravidade da cápsula desligada; velocidade = `(alvo − posição)/dt` limitada a `3 * GrindSpeed` (robusta a qualquer FPS); a cápsula gira para a tangente (velocidade angular em Z limitada a ±360°/s). O alvo fica `GrindHeightOffset` acima da spline.
+- **Fim:** ao chegar à chave máxima/mínima, `EndGrind` religa a gravidade e o pawn sai com a inércia.
+- **Saída por pulo:** um novo pressionamento de Jump durante o Grind chama `EndGrind` e o pulo original executa em seguida. Se o botão já estava segurado ao encaixar, precisa ser solto antes (`bJumpHeld`/`bGrindJumpReleased`). Enquanto o Grind está ativo, o corpo do `Jump` original é pulado.
+- **Sem re-encaixe imediato:** ao sair (fim ou pulo), o pawn ignora aquele rail (`GrindIgnoreSpline`) até tocar o chão; sem isso o pulo (~130 u de altura) reencaixava em ~0,6 s. Há também `GrindCooldown`.
+
+### 6.7.2 Implementação (`BPC_WheelchairMovement`)
+
+- **Funções novas:** `TryStartGrind`, `StartGrind(Spline)`, `UpdateGrind`, `EndGrind`, `HandleGrindJump(bJump)`.
+- **Variáveis novas (categoria *Grind*):** `bIsGrinding`, `bJumpHeld`, `bGrindJumpReleased`, `bGrindArmed`, `GrindSpline`, `GrindIgnoreSpline`, `GrindInputKey`, `GrindDirection`, `GrindResumeTime`. Editáveis por instância: `GrindSpeed` (900), `GrindHeightOffset` (190), `GrindMinFallSpeed` (100), `GrindCooldown` (0,5), `GrindMaxSnapDistance` (300).
+- **Encaixe em `Movement`:** `Movement → Branch(bIsGrinding)`: verdadeiro → `UpdateGrind`; falso → `CheckIfFalling` → `TryStartGrind` → fluxo original. `CheckIfFalling` roda **antes** de `TryStartGrind` para o teste de chão ser atual.
+- **Encaixe em `Jump`:** `Jump → HandleGrindJump(bIsJump) → Branch(bIsGrinding)`: falso → fluxo original. Na saída por pulo, `bIsFalling` é forçado a `true` para o pulo original passar na condição de "no chão" (o nome está invertido: `true` = no chão).
+- **Padrões:** aplicados na classe (`Default__BPC_WheelchairMovement_C`).
+
+### 6.7.3 Grind só depois de pular (fix do "encaixa em degrau")
+
+**Problema:** o Grind disparava ao passar por um degrau/desnível no chão perto de um rail. A cápsula é um corpo físico e um degrau já produz `vz < −100`.
+
+**Correção:** `bGrindArmed`. O `Jump` seta `true` depois de aplicar o impulso (só acontece quando o pulo realmente ocorre). `TryStartGrind` seta `false` quando o pawn está no chão e `vz ≤ 50` (o limite evita desarmar no 1º frame do pulo, quando o chão ainda é detectado) e exige `bGrindArmed` para iniciar. Cair de uma borda sem pular **não** faz Grind. A saída por pulo do Grind rearma, permitindo encaixar em outro rail.
+
+### 6.7.4 Mudança no `BP_SplineGrindMaster`
+
+Cada segmento de `SplineMesh` agora responde **Overlap** a `Pawn` e `PhysicsBody` (2 chamadas `SetCollisionResponseToChannel` no loop do `ConstructionScript`). Antes o rail (`Custom`, tipo `Interactable`, resto `Block`) bloqueava fisicamente a cápsula, que arrastava a ~190 u/s e nunca gerava overlap real (a detecção só funcionava por acaso via a esfera `WidgetRadius` herdada de `BP_InteractableMaster`, que fica na origem do ator). **Consequência:** o rail deixa de ser sólido para o jogador. `Visibility`/`Camera` continuam Ignore.
+
+### 6.7.5 Validação (PIE)
+
+- Queda sobre o rail: START, ~905 u/s ao longo do rail, END na ponta (chave 0,996), sem re-início.
+- Pulo durante o Grind: sai no mesmo frame, sem re-encaixe até tocar o chão.
+- Sem pular (pawn dentro do volume do rail): sem Grind. Pulando: Grind. `PrintString`s de debug usados nos testes foram removidos.
+- **Não testado:** spline curva ou com vários segmentos, degrau real dirigindo, pulo normal fora do Grind em runtime (só leitura do grafo), multiplayer (o Grind roda onde o `Movement` roda, sem checagem de autoridade).
+- **Nota de teste:** o editor em segundo plano estrangula o PIE a ~3 FPS (`bThrottleCPUWhenNotForeground`); para testes automatizados foi desligado só em memória e restaurado.
+
+---
+
 ## 7. Débito técnico / pendências
 
 - **Prints de debug temporários** ainda presentes (usados para diagnosticar os bugs de velocidade zerada):
@@ -192,6 +233,12 @@ O ator implementa `BPI_Grab` (passava na checagem), mas `IsSimulatingPhysics(Hit
   - O branch do `IA_Shoot` em `BP_CharacterMaster` testa `AnimationChooser == NewEnumerator4`, mas o item 4.4 acima diz que a condição foi trocada por `true`; não foi confirmado o que é `NewEnumerator4` nem se equipar a `BP_GrabPistol` seta esse valor.
   - `TryGrab` usa `IsInputKeyDown(LeftMouseButton)` fixo (quebra com rebind/gamepad); a roda do mouse também é lida direto.
   - Grab e linha de debug são só locais (`ItemMaster` tem `bReplicateMovement = false`).
+- **Grind — observações:**
+  - O corpo de `BPC_WheelchairMovement::Jump` roda também no *release* do botão (e sem guarda de `bIsJump`), repetindo o impulso de 800; comportamento anterior, não alterado.
+  - Rail com escala não uniforme não foi testado; o `GrindHeightOffset` padrão (190) assume o mesh `SM_BoxCentered` (100 de altura) e cápsula de meia altura 90.
+  - Rails deixaram de ser sólidos para o Pawn/PhysicsBody (ver 6.7.4).
+  - O `.uasset` do `BPC_WheelchairMovement` cresceu (~240 KB → ~1,4 MB) por causa dos nós gerados via DSL.
+- **Interação (F) com `BP_ItemMaster` — diagnóstico (sem alteração de código):** a instância `BP_ItemMaster_C_1` do `L_Sandbox` tem `ItemInfo = None`; `AttachItem` lê `ShotAbility` e `Socket` do `ItemInfoReference` e gera `Accessed None` (nós `Branch` e `Attach Actor To Component`), então o item não fica na mão. Além disso, `InteractDetect` não valida o resultado do trace (F em parede/vazio chama `AttachItem` com ator inválido e solta o item segurado) e o trace sai da raiz do `PlayerCameraManager` (~800 u atrás do pawn, 1200 de comprimento, na altura da câmera).
 
 ---
 
@@ -199,7 +246,8 @@ O ator implementa `BPI_Grab` (passava na checagem), mas `IsSimulatingPhysics(Hit
 
 | Arquivo | Tipo de mudança |
 |---|---|
-| `Content/Main/Core/Components/BPC_WheelchairMovement` | Fix gravidade extra + damping angular |
+| `Content/Main/Core/Components/BPC_WheelchairMovement` | Fix gravidade extra + damping angular; **Grind/Slide** (funções `TryStartGrind`/`StartGrind`/`UpdateGrind`/`EndGrind`/`HandleGrindJump`, variáveis *Grind*, gate `bGrindArmed`, ramos em `Movement` e `Jump`) |
+| `Content/Main/Core/Interactables/BP_SplineGrindMaster` | Segmentos do rail com resposta Overlap a `Pawn`/`PhysicsBody` |
 | `Content/Main/Core/Components/BPC_InteractionDetector` | Fix colisão da esfera do item + guarda `IsValidClass` |
 | `Content/Main/Core/Abilities/GA_Throw` | **Novo** — ability de arremesso |
 | `Content/Main/Core/Abilities/GA_Catch` | **Novo** — ability de captura |
