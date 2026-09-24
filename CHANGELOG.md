@@ -252,15 +252,69 @@ Reescrever um grafo via DSL **não apaga os nós antigos**: eles ficam desconect
 
 ---
 
+## 6.9 Multiplayer — bloco 2: replicação completa (interação, itens, habilidades, estados)
+
+Modelo mantido: **servidor autoritativo**; o cliente só envia intenção + mira. Validado em PIE com servidor dedicado + 2 clientes, comparando o estado nos 3 mundos.
+
+### 6.9.1 Canal cliente → servidor via GAS
+
+As ferramentas MCP não criam RPCs nem alteram flags (e `write_graph_dsl` no `EventGraph` de `BP_CharacterMaster` **apaga o grafo colapsado "Inputs"** — testado numa cópia; esse grafo só foi editado nó a nó). Solução:
+- **`GA_ClientRequest`** (novo): `LocalPredicted`, `InstancedPerActor`, trigger por Gameplay Event `Event.Request` (tags filhas também disparam). No servidor chama `BP_CharacterMaster.HandleClientRequest(EventData)`, que despacha pela tag: `Event.Request.AnimState`, `.Horn`, `.GrabUpdate`, `.GrabRelease`.
+- **`SendClientRequest(Tag, Magnitude, Start, End)`**: monta o `GameplayEventData` com um `HitResult` em `TargetData` (`TraceStart`/`Location`); o GAS leva os dados ao servidor.
+- **Tiro:** `HandleShoot` envia `Event.Ability.Shoot` com a mira da câmera (origem + direção). `GA_SauceShot`, `GA_Throw` e `GA_GrabShot` passaram a ser disparadas por essa tag (triggers configurados) e só agem com autoridade, refazendo o trace no servidor com o alcance original de cada uma (2500 / 3000 / `GrabRange`).
+- No ramo do cliente as abilities usam **`EndAbilityLocally`**: `EndAbility` replicava o fim ao servidor e matava a lógica latente do `GA_Throw` (`DelayUntilNextTick`), que soltava o sauce sem arremessar.
+
+### 6.9.2 Input (`BP_CharacterMaster`)
+
+Handlers de `IA_Move`, `IA_Aim`, `IA_Emote`, `IA_Shoot` e `IA_Horn` saíram do grafo colapsado e foram recriados no `EventGraph`, chamando funções novas: `HandleMoveInput` (quantiza 0,05 e só envia `ServerRPC_SendInput` quando muda, com reenvio a cada 0,25 s enquanto ≠ 0), `HandleAim`, `HandleEmote`, `HandleShoot`, `HandleShootReleased`, `HandleHorn`. Jump, Interact, Look, Sprint e os eventos RPC continuam no grafo colapsado, intactos. As flags dos 8 RPCs originais foram conferidas no `.uasset` depois das edições.
+
+### 6.9.3 Estados e animação
+
+- `AnimationChooser` (RepNotify) agora é definido no servidor (`RequestAnimState` → `ApplyAnimState`), com previsão local no dono; `BoneAnim` passou a `Replicated`. O servidor aplica `Idle` no `BeginPlay`.
+- **Armadilha do enum:** em `E_PlayerChooser` os **valores numéricos não batem com os nomes** `NewEnumeratorN` (o valor 0 é "None"). Os chamadores usam literais do enum (`NewEnumerator0` Idle, `1` Smoking, `4` Aim, `6` Throw) em vez de números.
+- O gate do LMB aceita `Aim` **ou** `Throw` — antes só `Aim`, então o `GA_Throw` nunca era ativado pelo input.
+- Buzina: `HornCount` (RepNotify); `OnRep_HornCount` toca o som nos outros jogadores.
+- Lip-sync: o Tick agora envia `Server_SetSpeaking(true)` também (antes só enviava `false`).
+
+### 6.9.4 Itens, projéteis e splat
+
+- `BP_ProjectileMaster`: `bReplicates` + `bReplicateMovement`; o hit (spawn do splat + destroy) só com autoridade.
+- `BP_SplatSauce`: `bReplicates`; `SplatIndex` (Replicated) sorteado no servidor para a variação ser igual em todos; lifespan e atrito (`bOnSplat`) só com autoridade.
+- `BP_SauceMaster`: catch e pouso (splat + destroy) só com autoridade; removido o `PrintString` por tick.
+- `BP_ItemMaster.OnRep_bHeld`: nos clientes anexa o item ao socket da mão do `Owner` (e desanexa ao largar). Corrige a condição de corrida em que a `AttachmentReplication` chegava com o item ainda simulando física e os clientes o viam flutuando onde estava.
+- `BPC_InteractionDetector`: `AttachItem` faz `ClearAbility` da ability anterior antes de conceder a nova (handle em `ShotAbilityHandle`) — sem duplicatas e sem cancelar uma ability em execução; `DetachItem` limpa `EquippedItemInfo` e o impulso ao largar passou a ser só para cima (antes somava a posição no mundo ao vetor).
+
+### 6.9.5 Grab (`BP_GrabPistol` / `GA_GrabShot`)
+
+Grab feito no servidor (`PhysicsHandle`); `bGrabbing` e `GrabDistance` replicados. O dono calcula o alvo (câmera + roda do mouse) e envia `Event.Request.GrabUpdate` a no máximo 20 Hz e só se o alvo mexer > 1 cm; o servidor aplica e solta sozinho se o objeto sumir/parar de simular (`ServerValidateGrab`). Removido o `IsInputKeyDown(LeftMouseButton)` fixo.
+
+### 6.9.6 Movimento, crash e framework
+
+- `BPC_WheelchairMovement`: `ServerRPC_Movement` usa o `CurrentState` **do personagem** (não andava mais o valor do componente, que nunca mudava) → não dirige tombado; inputs com clamp −1..1 no servidor. Componentes com `bReplicates = true` no template.
+- Crash: `OnComponentHit` só com autoridade; `RettachPlayerMulticast` só é disparado pelo servidor (antes os clientes o executavam em dobro); camera shake só no jogador local; `SetRelativeTransform` do reattach com `Teleport`.
+- `SetupLocalPlayer` (via `ReceiveControllerChanged`): `PlayerControllerReference` também no servidor, mapping context no cliente mesmo se o `BeginPlay` rodar antes da posse, microfone só no pawn local.
+- `BP_WWController`: HUD só com `IsLocalPlayerController` (o erro `Accessed None` no servidor sumiu).
+- `BP_InteractableMaster`: prompt mostra/esconde só para o pawn local (o `FlipFlop` era alternado por qualquer jogador).
+- `DefaultEngine.ini`: `GlobalDefaultGameMode` apontava para `/Game/Main/Core/BP_WWGameMode` (inexistente) → `/Game/Main/Core/Framework/BP_WWGameMode`.
+
+### 6.9.7 Validação (PIE: servidor dedicado + 2 clientes)
+
+Input simulado por um harness temporário no `BP_WWController` (removido depois; `PressKey` não aciona o Enhanced Input). Conferido nos 3 mundos: estado inicial, emote on/off (também a partir do cliente 2), buzina, mira, pickup/largar/troca de arma (sem abilities duplicadas), grab (objeto na mesma posição para todos) e soltar, tiro de molho (splat na mesma posição e índice), arremesso completo (arco → pouso → splat → destroy nos clientes), movimento (posição idêntica; keep-alive ativo) e crash → recuperação. Log sem erros novos; todos os 25 Blueprints compilam com warnings-as-errors.
+
+**Não testado ao vivo:** lip-sync (precisa de microfone), atrito do splat (o pawn passou rápido demais).
+
+---
+
 ## 7. Débito técnico / pendências
 
-- **Prints de debug temporários** ainda presentes (usados para diagnosticar os bugs de velocidade zerada):
-  - `GA_Throw`: `PrintString` mostrando a velocidade lida logo após `SetPhysicsLinearVelocity`.
-  - `BP_SauceMaster`: `PrintString` mostrando a magnitude da velocidade a cada tick enquanto `bIsThrown`.
-  - **Ação recomendada:** remover ambos após confirmação final de que o arremesso funciona corretamente em todos os cenários.
+- ~~Prints de debug temporários em `GA_Throw` e `BP_SauceMaster`~~ — removidos no bloco 2 (6.9).
+- **Crash:** qualquer contato com ator de tag `Obstacle` derruba (limiar `velocidade > 0 * 0.2`); encostado numa parede, tomba de novo a cada 3 s. Comportamento anterior, não alterado.
+- **RPCs Reliable:** `ServerRPC_SendInput` continua Reliable (as ferramentas não mudam flags); o envio agora é só na mudança/keep-alive. Trocar para Unreliable no editor é opcional.
+- **Código morto mantido:** `RPC_LocalMic`, `Multicast_Jump`, `JawOpenAmount` replicado sem uso, função `GA_GrabShot::TryGrab` antiga.
+- **Sprint:** o branch de `IA_Sprint` tem condição `AND(false, …)` — não faz nada (anterior).
 - **Parâmetros de arremesso hardcoded** (não expostos para ajuste manual): alcance do trace (3000), altura do arco (`ArcParam = 0.35`), gravidade do arremesso (`OverrideGravityZ = -1500`), tempo de desenho do debug (`DrawDebugTime = 2.0`), limiar de velocidade para considerar "pousado" (`5.0`). Considerar expor como variáveis `Instance Editable` em `GA_Throw`/`BP_SauceMaster` se for necessário balancear o gameplay.
 - **`.gitignore`**: os padrões `Saved/`, `Intermediate/`, `DerivedDataCache/`, `Binaries/` e `Build/` foram prefixados com `**/` para funcionar com o projeto aninhado em `WheelyWiener_V01/` (ver `PROJECT_STATUS.md`, item 4). `.idea/` ainda não é ignorado.
-- **Grab — pendências identificadas e não corrigidas:**
+- **Grab — pendências abaixo foram tratadas no bloco 2 (6.9.4/6.9.5), exceto a leitura direta da roda do mouse:**
   - `BPC_InteractionDetector::DetachItem` não faz `ReleaseComponent`, não zera `bGrabbing`, não limpa o `Owner` nem faz `ClearAbility`; largar/trocar a pistola segurando um objeto deixa o estado inconsistente.
   - `AttachItem` chama `GiveAbility` a cada pickup sem remover a anterior → abilities duplicadas ao pegar/largar várias vezes.
   - O branch do `IA_Shoot` em `BP_CharacterMaster` testa `AnimationChooser == NewEnumerator4`, mas o item 4.4 acima diz que a condição foi trocada por `true`; não foi confirmado o que é `NewEnumerator4` nem se equipar a `BP_GrabPistol` seta esse valor.
@@ -271,7 +325,7 @@ Reescrever um grafo via DSL **não apaga os nós antigos**: eles ficam desconect
   - Rail com escala não uniforme não foi testado; o `GrindHeightOffset` padrão (190) assume o mesh `SM_BoxCentered` (100 de altura) e cápsula de meia altura 90.
   - Rails deixaram de ser sólidos para o Pawn/PhysicsBody (ver 6.7.4).
   - O `.uasset` do `BPC_WheelchairMovement` cresceu (~240 KB → ~655 KB) por causa dos nós gerados via DSL (depois da limpeza de órfãos, ver 6.8.4).
-- **Multiplayer — pendências da análise (ainda não tratadas):** interação/`AttachItem` e `HeldItem` só no cliente que apertou F, `GiveAbility` chamado no cliente (inválido no GAS), projéteis/splat/`bIsThrown` não replicados e `DestroyActor`/`SpawnActor` em todas as máquinas, `AnimationChooser` (mira/emote) setado só localmente, grab e grind sem servidor, `PlayerControllerReference` só no dono (usado por `GA_SauceShot`), `OnComponentHit`→`DetachPlayerMulticast` em todas as máquinas, HUD sem `IsLocalController`, prompt de `BP_InteractableMaster` sem checar jogador local.
+- **Multiplayer — pendências da análise: todas tratadas no bloco 2 (6.9)**, exceto Grind (roda só no servidor via `Movement`; não testado em rede). Lista original: interação/`AttachItem` e `HeldItem` só no cliente que apertou F, `GiveAbility` chamado no cliente (inválido no GAS), projéteis/splat/`bIsThrown` não replicados e `DestroyActor`/`SpawnActor` em todas as máquinas, `AnimationChooser` (mira/emote) setado só localmente, grab e grind sem servidor, `PlayerControllerReference` só no dono (usado por `GA_SauceShot`), `OnComponentHit`→`DetachPlayerMulticast` em todas as máquinas, HUD sem `IsLocalController`, prompt de `BP_InteractableMaster` sem checar jogador local.
 - **Interação (F) com `BP_ItemMaster` — diagnóstico (sem alteração de código):** a instância `BP_ItemMaster_C_1` do `L_Sandbox` tem `ItemInfo = None`; `AttachItem` lê `ShotAbility` e `Socket` do `ItemInfoReference` e gera `Accessed None` (nós `Branch` e `Attach Actor To Component`), então o item não fica na mão. Além disso, `InteractDetect` não valida o resultado do trace (F em parede/vazio chama `AttachItem` com ator inválido e solta o item segurado) e o trace sai da raiz do `PlayerCameraManager` (~800 u atrás do pawn, 1200 de comprimento, na altura da câmera).
 
 ---
@@ -296,6 +350,13 @@ Reescrever um grafo via DSL **não apaga os nós antigos**: eles ficam desconect
 | `Content/Main/Core/Items/BP_GrabPistol` | Função `UpdateHeldObject`; variáveis `MaxGrabDistance`, `GrabDistanceStep`, `GrabHeightOffset`; roda do mouse, linha de debug, offset de altura |
 | `.gitignore` | Padrões `Saved/`, `Intermediate/`, `Binaries/`, `Build/`, `DerivedDataCache/` com `**/` |
 | `Content/Main/Maps/Sandbox/L_Sandbox` | Fix de colisão Pawn=Ignore nas 3 instâncias de `BP_SauceMaster` já posicionadas |
+| `Content/Main/Core/Abilities/GA_ClientRequest` | **Novo** (bloco 2) — canal cliente → servidor |
+| `Content/Main/Core/Abilities/GA_SauceShot`, `GA_Throw`, `GA_GrabShot` | Bloco 2 — trigger `Event.Ability.Shoot`, lógica só com autoridade, `EndAbilityLocally` no cliente |
+| `Content/Main/Core/Player/BP_CharacterMaster` (bloco 2) | 16 funções novas, handlers de input no `EventGraph`, `HornCount`, `BoneAnim`/`bGrabbing` replicados, gates de autoridade no crash |
+| `Content/Main/Core/Items/BP_ItemMaster`, `BP_ProjectileMaster`, `BP_SplatSauce`, `BP_SauceMaster`, `BP_GrabPistol` | Bloco 2 — replicação e autoridade |
+| `Content/Main/Core/Components/BPC_InteractionDetector`, `BPC_WheelchairMovement` | Bloco 2 — `ClearAbility`, `EquippedItemInfo`, estado do personagem, clamp |
+| `Content/Main/Core/Framework/BP_WWController`, `Interactables/BP_InteractableMaster` | Bloco 2 — HUD e prompt só locais |
+| `Config/DefaultEngine.ini`, `Config/DefaultGameplayTags.ini` | Caminho do GameMode; tags `Event.Request.*` e `Event.Ability.Shoot` |
 
 ---
 
